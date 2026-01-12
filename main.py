@@ -248,7 +248,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# MAIN
+# 
 # =========================
 def main():
     ensure_env()
@@ -261,11 +261,11 @@ def main():
 
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    # background idle monitor
-    application.job_queue.run_once(lambda *_: None, when=0)  # ensure job queue init
+    # background idle monitor (sem job queue)
     application.create_task(idle_monitor(application))
 
     application.run_polling()
+
 
 
 if __name__ == "__main__":
