@@ -2,9 +2,8 @@ import os
 import re
 import time
 import smtplib
-import asyncio
+import threading
 from email.message import EmailMessage
-from typing import Optional
 
 from telegram import Update
 from telegram.ext import (
@@ -27,7 +26,6 @@ GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "").strip()
 # Bot behaviour
 IDLE_SLEEP_SECONDS = 2 * 60 * 60  # 2h
 SUPPORTED_EXT = (".epub",)
-
 
 # =========================
 # GLOBAL STATE
@@ -52,6 +50,7 @@ def ensure_env():
         missing.append("GMAIL_ADDRESS")
     if not GMAIL_APP_PASSWORD:
         missing.append("GMAIL_APP_PASSWORD")
+
     if missing:
         raise RuntimeError("Missing environment variables: " + ", ".join(missing))
 
@@ -93,7 +92,6 @@ def send_email_to_kindle(file_bytes: bytes, filename: str):
     msg["Subject"] = "Send to Kindle"
     msg.set_content("Enviado pelo BOT Kindlinho 🫶🏻")
 
-    # For EPUB: application/epub+zip
     msg.add_attachment(
         file_bytes,
         maintype="application",
@@ -106,15 +104,16 @@ def send_email_to_kindle(file_bytes: bytes, filename: str):
         smtp.send_message(msg)
 
 
-async def idle_monitor(app: Application):
-    """Auto /stop after 2 hours idle while in kindle mode."""
+def idle_monitor_thread(app: Application):
+    """Auto stop after 2 hours idle while in kindle mode."""
     global kindle_mode, received, sent_ok, sent_fail, errors
+
     while True:
-        await asyncio.sleep(30)
+        time.sleep(30)
+
         if kindle_mode:
             idle = time.time() - last_activity
             if idle >= IDLE_SLEEP_SECONDS:
-                # auto stop
                 kindle_mode = False
 
                 summary = (
@@ -124,6 +123,7 @@ async def idle_monitor(app: Application):
                     f"✅ Enviados com sucesso: {sent_ok}\n"
                     f"❌ Erros: {sent_fail}"
                 )
+
                 if errors:
                     summary += "\n\n⚠️ Erros:\n" + "\n".join(f"• {e}" for e in errors[:10])
 
@@ -134,7 +134,7 @@ async def idle_monitor(app: Application):
                 errors = []
 
                 try:
-                    await app.bot.send_message(chat_id=ALLOWED_USER_ID, text=summary)
+                    app.bot.send_message(chat_id=ALLOWED_USER_ID, text=summary)
                 except:
                     pass
 
@@ -155,10 +155,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_kindle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global kindle_mode, received, sent_ok, sent_fail, errors
+
     if await deny_if_not_owner(update):
         return
-    touch()
 
+    touch()
     kindle_mode = True
     received = 0
     sent_ok = 0
@@ -173,8 +174,10 @@ async def cmd_kindle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global kindle_mode, received, sent_ok, sent_fail, errors
+
     if await deny_if_not_owner(update):
         return
+
     touch()
 
     if not kindle_mode:
@@ -189,6 +192,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Enviados com sucesso: {sent_ok}\n"
         f"❌ Erros: {sent_fail}"
     )
+
     if errors:
         msg += "\n\n⚠️ Erros:\n" + "\n".join(f"• {e}" for e in errors[:10])
 
@@ -211,6 +215,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if await deny_if_not_owner(update):
         return
+
     touch()
 
     if not kindle_mode:
@@ -220,13 +225,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     filename = doc.file_name or "livro.epub"
 
-    # Accept only EPUB
     if not filename.lower().endswith(SUPPORTED_EXT):
         await update.message.reply_text("Esse ficheiro não é EPUB 😅\nEnvia um .epub e eu trato do resto.")
         return
 
     received += 1
 
+    # Download file
     try:
         tg_file = await context.bot.get_file(doc.file_id)
         file_bytes = await tg_file.download_as_bytearray()
@@ -236,6 +241,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Erro ao descarregar: {filename}")
         return
 
+    # Send email
     try:
         send_email_to_kindle(bytes(file_bytes), filename)
         sent_ok += 1
@@ -248,7 +254,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# 
+# MAIN
 # =========================
 def main():
     ensure_env()
@@ -261,11 +267,11 @@ def main():
 
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    # background idle monitor (sem job queue)
-    application.create_task(idle_monitor(application))
+    # Start idle monitor (thread)
+    threading.Thread(target=idle_monitor_thread, args=(application,), daemon=True).start()
 
+    # Start polling
     application.run_polling()
-
 
 
 if __name__ == "__main__":
