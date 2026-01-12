@@ -143,6 +143,9 @@ def idle_monitor_thread(app: Application):
 # COMMANDS
 # =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch()
+    await update.message.reply_text(f"DEBUG: teu user_id = {update.effective_user.id}")
+    
     if await deny_if_not_owner(update):
         return
     touch()
