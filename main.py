@@ -1,280 +1,272 @@
 import os
-import io
 import re
 import time
 import smtplib
-import threading
+import asyncio
 from email.message import EmailMessage
+from typing import Optional
 
-import telebot
-from flask import Flask, request
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 # =========================
-# CONFIG (Render env vars)
+# ENV VARS (Render)
 # =========================
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
-KINDLE_EMAIL = os.getenv("KINDLE_EMAIL", "")
-GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS", "")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
+KINDLE_EMAIL = os.getenv("KINDLE_EMAIL", "").strip()
+GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS", "").strip()
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "").strip()
 
-# Sleep after 2h idle (seconds)
-IDLE_SLEEP_SECONDS = 2 * 60 * 60
+# Bot behaviour
+IDLE_SLEEP_SECONDS = 2 * 60 * 60  # 2h
+SUPPORTED_EXT = (".epub",)
 
-if not BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
-if not ALLOWED_USER_ID:
-    raise RuntimeError("Missing/invalid ALLOWED_USER_ID")
-if not KINDLE_EMAIL:
-    raise RuntimeError("Missing KINDLE_EMAIL")
-if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
-    raise RuntimeError("Missing Gmail credentials")
-
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-app = Flask(__name__)
 
 # =========================
-# State
+# GLOBAL STATE
 # =========================
-state = {
-    "kindle_mode": False,
-    "received": 0,
-    "sent_ok": 0,
-    "sent_fail": 0,
-    "errors": [],
-    "last_activity": time.time(),
-}
+kindle_mode = False
+received = 0
+sent_ok = 0
+sent_fail = 0
+errors = []
+last_activity = time.time()
 
-lock = threading.Lock()
 
-# =========================
-# Helpers
-# =========================
-def only_owner(message):
-    return message.from_user and message.from_user.id == ALLOWED_USER_ID
+def ensure_env():
+    missing = []
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not ALLOWED_USER_ID:
+        missing.append("ALLOWED_USER_ID")
+    if not KINDLE_EMAIL:
+        missing.append("KINDLE_EMAIL")
+    if not GMAIL_ADDRESS:
+        missing.append("GMAIL_ADDRESS")
+    if not GMAIL_APP_PASSWORD:
+        missing.append("GMAIL_APP_PASSWORD")
+    if missing:
+        raise RuntimeError("Missing environment variables: " + ", ".join(missing))
+
+
+def is_owner(update: Update) -> bool:
+    user = update.effective_user
+    return bool(user and user.id == ALLOWED_USER_ID)
+
+
+async def deny_if_not_owner(update: Update) -> bool:
+    """Returns True if denied."""
+    if is_owner(update):
+        return False
+    if update.message:
+        await update.message.reply_text("🚫 Este bot é privado.")
+    return True
+
 
 def touch():
-    with lock:
-        state["last_activity"] = time.time()
+    global last_activity
+    last_activity = time.time()
+
 
 def prettify_title(filename: str) -> str:
-    # remove extension
-    name = re.sub(r"\.epub$", "", filename, flags=re.IGNORECASE)
-    # replace _ and - by space
+    name = filename
+    for ext in SUPPORTED_EXT:
+        if name.lower().endswith(ext):
+            name = name[: -len(ext)]
+            break
     name = name.replace("_", " ").replace("-", " ")
-    # collapse spaces
     name = re.sub(r"\s+", " ", name).strip()
     return name
 
-def send_email_to_kindle(epub_bytes: bytes, filename: str):
+
+def send_email_to_kindle(file_bytes: bytes, filename: str):
     msg = EmailMessage()
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = KINDLE_EMAIL
     msg["Subject"] = "Send to Kindle"
-    msg.set_content("Kindlinho 🫶🏻")
+    msg.set_content("Enviado pelo BOT Kindlinho 🫶🏻")
 
+    # For EPUB: application/epub+zip
     msg.add_attachment(
-        epub_bytes,
+        file_bytes,
         maintype="application",
         subtype="epub+zip",
-        filename=filename
+        filename=filename,
     )
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
         smtp.send_message(msg)
 
-def deny_if_not_owner(message):
-    if not only_owner(message):
-        try:
-            bot.reply_to(message, "🚫 Este bot é privado.")
-        except:
-            pass
-        return True
-    return False
 
-def ensure_kindle_mode(message):
-    with lock:
-        return state["kindle_mode"]
-
-# =========================
-# Idle sleep monitor
-# =========================
-def idle_monitor():
+async def idle_monitor(app: Application):
+    """Auto /stop after 2 hours idle while in kindle mode."""
+    global kindle_mode, received, sent_ok, sent_fail, errors
     while True:
-        time.sleep(30)
-        with lock:
-            if state["kindle_mode"]:
-                idle = time.time() - state["last_activity"]
-                if idle >= IDLE_SLEEP_SECONDS:
-                    # auto stop
-                    state["kindle_mode"] = False
-                    summary = (
-                        f"😴 Sem atividade há 2h.\n"
-                        f"Modo Kindle desativado 🫶🏻\n\n"
-                        f"📥 Recebidos: <b>{state['received']}</b>\n"
-                        f"✅ Enviados com sucesso: <b>{state['sent_ok']}</b>\n"
-                        f"❌ Erros: <b>{state['sent_fail']}</b>"
-                    )
-                    # reset counters after stopping
-                    state["received"] = 0
-                    state["sent_ok"] = 0
-                    state["sent_fail"] = 0
-                    state["errors"] = []
-                    try:
-                        bot.send_message(ALLOWED_USER_ID, summary)
-                    except:
-                        pass
+        await asyncio.sleep(30)
+        if kindle_mode:
+            idle = time.time() - last_activity
+            if idle >= IDLE_SLEEP_SECONDS:
+                # auto stop
+                kindle_mode = False
 
-threading.Thread(target=idle_monitor, daemon=True).start()
+                summary = (
+                    "😴 Sem atividade há 2h.\n"
+                    "Modo Kindle desativado 🫶🏻\n\n"
+                    f"📥 Recebidos: {received}\n"
+                    f"✅ Enviados com sucesso: {sent_ok}\n"
+                    f"❌ Erros: {sent_fail}"
+                )
+                if errors:
+                    summary += "\n\n⚠️ Erros:\n" + "\n".join(f"• {e}" for e in errors[:10])
+
+                # reset
+                received = 0
+                sent_ok = 0
+                sent_fail = 0
+                errors = []
+
+                try:
+                    await app.bot.send_message(chat_id=ALLOWED_USER_ID, text=summary)
+                except:
+                    pass
+
 
 # =========================
-# Commands
+# COMMANDS
 # =========================
-@bot.message_handler(commands=["start"])
-def cmd_start(message):
-    if deny_if_not_owner(message):
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_if_not_owner(update):
         return
     touch()
-    bot.reply_to(
-        message,
+    await update.message.reply_text(
         "Olá Lu 🫶🏻\n"
-        "Sou o <b>BOT Kindlinho 🫶🏻</b>.\n"
-        "Estou pronto para enviar livros para o teu Kindle 📚\n\n"
-        "Quando quiseres começar, usa <b>/kindle</b>."
+        "Sou o BOT Kindlinho 🫶🏻.\n\n"
+        "Quando quiseres enviar livros para o Kindle, usa /kindle 📚"
     )
 
-@bot.message_handler(commands=["kindle"])
-def cmd_kindle(message):
-    if deny_if_not_owner(message):
+
+async def cmd_kindle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global kindle_mode, received, sent_ok, sent_fail, errors
+    if await deny_if_not_owner(update):
         return
     touch()
-    with lock:
-        state["kindle_mode"] = True
-        state["received"] = 0
-        state["sent_ok"] = 0
-        state["sent_fail"] = 0
-        state["errors"] = []
-    bot.reply_to(
-        message,
+
+    kindle_mode = True
+    received = 0
+    sent_ok = 0
+    sent_fail = 0
+    errors = []
+
+    await update.message.reply_text(
         "Modo Kindle ativo ✅\n"
         "Agora envia os teus EPUBs (podes mandar vários)."
     )
 
-@bot.message_handler(commands=["stop"])
-def cmd_stop(message):
-    if deny_if_not_owner(message):
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global kindle_mode, received, sent_ok, sent_fail, errors
+    if await deny_if_not_owner(update):
         return
     touch()
 
-    with lock:
-        was_on = state["kindle_mode"]
-        state["kindle_mode"] = False
-
-        received = state["received"]
-        sent_ok = state["sent_ok"]
-        sent_fail = state["sent_fail"]
-        errors = list(state["errors"])
-
-        # reset after summary
-        state["received"] = 0
-        state["sent_ok"] = 0
-        state["sent_fail"] = 0
-        state["errors"] = []
-
-    if not was_on:
-        bot.reply_to(message, "Eu já estava em descanso 🫶🏻")
+    if not kindle_mode:
+        await update.message.reply_text("Eu já estava em descanso 🫶🏻")
         return
 
-    txt = (
+    kindle_mode = False
+
+    msg = (
         "Modo Kindle desativado 🫶🏻\n\n"
-        f"📥 Recebidos: <b>{received}</b>\n"
-        f"✅ Enviados com sucesso: <b>{sent_ok}</b>\n"
-        f"❌ Erros: <b>{sent_fail}</b>\n"
+        f"📥 Recebidos: {received}\n"
+        f"✅ Enviados com sucesso: {sent_ok}\n"
+        f"❌ Erros: {sent_fail}"
     )
     if errors:
-        txt += "\n⚠️ Erros encontrados:\n" + "\n".join(f"• {e}" for e in errors[:10])
+        msg += "\n\n⚠️ Erros:\n" + "\n".join(f"• {e}" for e in errors[:10])
 
-    txt += "\n\nAté já 📚✨"
+    msg += "\n\nAté já 📚✨"
 
-    bot.reply_to(message, txt)
+    # reset counters after summary
+    received = 0
+    sent_ok = 0
+    sent_fail = 0
+    errors = []
+
+    await update.message.reply_text(msg)
+
 
 # =========================
-# File handler
+# DOCUMENT HANDLER
 # =========================
-@bot.message_handler(content_types=["document"])
-def handle_document(message):
-    if deny_if_not_owner(message):
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global received, sent_ok, sent_fail, errors
+
+    if await deny_if_not_owner(update):
         return
-
     touch()
 
-    if not ensure_kindle_mode(message):
-        bot.reply_to(message, "Antes disso usa <b>/kindle</b> para eu começar a enviar 📚")
+    if not kindle_mode:
+        await update.message.reply_text("Antes disso usa /kindle para eu começar a enviar 📚")
         return
 
-    doc = message.document
+    doc = update.message.document
     filename = doc.file_name or "livro.epub"
 
     # Accept only EPUB
-    if not filename.lower().endswith(".epub"):
-        bot.reply_to(message, "Esse ficheiro não é EPUB 😅\nEnvia um <b>.epub</b> e eu trato do resto.")
+    if not filename.lower().endswith(SUPPORTED_EXT):
+        await update.message.reply_text("Esse ficheiro não é EPUB 😅\nEnvia um .epub e eu trato do resto.")
         return
 
-    with lock:
-        state["received"] += 1
+    received += 1
 
-    # Download file from Telegram
     try:
-        file_info = bot.get_file(doc.file_id)
-        file_bytes = bot.download_file(file_info.file_path)
+        tg_file = await context.bot.get_file(doc.file_id)
+        file_bytes = await tg_file.download_as_bytearray()
     except Exception as e:
-        with lock:
-            state["sent_fail"] += 1
-            state["errors"].append(f"{filename}: falha a descarregar ({e})")
-        bot.reply_to(message, f"❌ Erro ao descarregar: <b>{filename}</b>")
+        sent_fail += 1
+        errors.append(f"{filename}: falha a descarregar ({e})")
+        await update.message.reply_text(f"❌ Erro ao descarregar: {filename}")
         return
 
-    # Send email
     try:
-        send_email_to_kindle(file_bytes, filename)
-        with lock:
-            state["sent_ok"] += 1
-
+        send_email_to_kindle(bytes(file_bytes), filename)
+        sent_ok += 1
         title = prettify_title(filename)
-        bot.reply_to(message, f"✅ Livro <b>{title}</b> foi enviado para o Kindlinho 🫶🏻")
-
+        await update.message.reply_text(f"✅ Livro {title} foi enviado para o Kindlinho 🫶🏻")
     except Exception as e:
-        with lock:
-            state["sent_fail"] += 1
-            state["errors"].append(f"{filename}: falha ao enviar email ({e})")
+        sent_fail += 1
+        errors.append(f"{filename}: falha ao enviar email ({e})")
+        await update.message.reply_text(f"❌ Erro ao enviar para Kindle: {filename}")
 
-        bot.reply_to(message, f"❌ Erro ao enviar para Kindle: <b>{filename}</b>")
 
 # =========================
-# Webhook endpoints for Render
+# MAIN
 # =========================
-@app.route("/", methods=["GET"])
-def home():
-    return "Kindlinho 🫶🏻 online!"
+def main():
+    ensure_env()
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
-    bot.process_new_updates([update])
-    return "OK", 200
+    application = Application.builder().token(BOT_TOKEN).build()
 
-def set_webhook(render_url: str):
-    bot.remove_webhook()
-    time.sleep(1)
-    bot.set_webhook(url=f"{render_url}/webhook")
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("kindle", cmd_kindle))
+    application.add_handler(CommandHandler("stop", cmd_stop))
+
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    # background idle monitor
+    application.job_queue.run_once(lambda *_: None, when=0)  # ensure job queue init
+    application.create_task(idle_monitor(application))
+
+    application.run_polling()
+
 
 if __name__ == "__main__":
-    # When running on Render, RENDER_EXTERNAL_URL is usually available
-    render_external = os.getenv("RENDER_EXTERNAL_URL", "")
-    if render_external:
-        set_webhook(render_external)
-
-    # Run flask
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    main()
